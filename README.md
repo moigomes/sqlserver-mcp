@@ -20,6 +20,7 @@ Servidor MCP (Model Context Protocol) em Python para consultar Microsoft SQL Ser
 - [Variáveis de Ambiente](#-variáveis-de-ambiente)
 - [Segurança](#-segurança)
 - [Dicas](#-dicas)
+- [Outros Clientes Compatíveis](#-outros-clientes-compatíveis)
 
 ---
 
@@ -372,6 +373,32 @@ Para ajustar o pool conforme sua carga:
 SQLSERVER_POOL_SIZE=10
 SQLSERVER_POOL_IDLE_TIME=600
 ```
+
+---
+
+## 🔌 Outros Clientes Compatíveis
+
+Este servidor MCP pode ser usado em qualquer cliente compatível com o **Model Context Protocol**. A configuração é similar à do Cursor.
+
+### IDEs e Editores
+- **Claude Desktop** (macOS, Windows) - App oficial da Anthropic
+- **VS Code + GitHub Copilot** - Suporte MCP em preview
+- **Zed** (macOS, Linux) - Editor moderno
+- **Windsurf** - IDE focada em IA
+- **Continue** - Extensão open-source para VS Code
+
+### Mobile e Desktop
+- **5ire** - Assistente IA desktop
+- **AIaW** - Cliente de chat multiplataforma
+- **Jenova AI** - Mobile + Desktop
+- **Systemprompt MCP** (iOS) - Controle por voz
+
+### Cloud e Enterprise
+- **Amazon Q Developer** - CLI da AWS
+- **Microsoft Sentinel** - Segurança com MCP
+
+> 📖 Lista completa de clientes: https://glama.ai/mcp/clients  
+> 📖 Especificação MCP: https://modelcontextprotocol.io
 
 ---
 
