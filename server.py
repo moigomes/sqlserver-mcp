@@ -1,11 +1,13 @@
 import atexit
+import functools
 import logging
 import os
 import re
 import threading
 import time
 from contextlib import contextmanager
-from typing import Any, Dict, Generator, List, Optional
+from enum import Enum
+from typing import Any, Callable, Dict, Generator, List, Optional, TypeVar
 
 import pyodbc
 from dotenv import load_dotenv
@@ -13,6 +15,213 @@ from mcp.server.fastmcp import FastMCP
 
 
 load_dotenv()
+
+# ============================================================================
+# EXCEÇÕES CUSTOMIZADAS
+# ============================================================================
+class ErrorCode(Enum):
+    """Códigos de erro padronizados."""
+    # Erros de conexão (1xx)
+    CONNECTION_FAILED = "E101"
+    CONNECTION_TIMEOUT = "E102"
+    CONNECTION_POOL_EXHAUSTED = "E103"
+    
+    # Erros de configuração (2xx)
+    MISSING_CONFIG = "E201"
+    INVALID_CONFIG = "E202"
+    
+    # Erros de validação (3xx)
+    VALIDATION_ERROR = "E301"
+    INVALID_QUERY = "E302"
+    SECURITY_VIOLATION = "E303"
+    
+    # Erros de execução (4xx)
+    QUERY_ERROR = "E401"
+    TABLE_NOT_FOUND = "E402"
+    COLUMN_NOT_FOUND = "E403"
+    PERMISSION_DENIED = "E404"
+    
+    # Erros internos (5xx)
+    INTERNAL_ERROR = "E501"
+    UNKNOWN_ERROR = "E599"
+
+
+class SQLServerMCPError(Exception):
+    """Exceção base para todos os erros do servidor MCP SQL Server."""
+    
+    def __init__(
+        self,
+        message: str,
+        code: ErrorCode = ErrorCode.UNKNOWN_ERROR,
+        details: Optional[Dict[str, Any]] = None,
+        original_error: Optional[Exception] = None,
+    ):
+        self.message = message
+        self.code = code
+        self.details = details or {}
+        self.original_error = original_error
+        super().__init__(self.message)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte o erro para um dicionário estruturado."""
+        result = {
+            "error": True,
+            "code": self.code.value,
+            "message": self.message,
+        }
+        if self.details:
+            result["details"] = self.details
+        return result
+    
+    def __str__(self) -> str:
+        return f"[{self.code.value}] {self.message}"
+
+
+class ConnectionError(SQLServerMCPError):
+    """Erro de conexão com o banco de dados."""
+    
+    def __init__(self, message: str, **kwargs):
+        super().__init__(message, code=ErrorCode.CONNECTION_FAILED, **kwargs)
+
+
+class ConfigurationError(SQLServerMCPError):
+    """Erro de configuração."""
+    
+    def __init__(self, message: str, **kwargs):
+        super().__init__(message, code=ErrorCode.MISSING_CONFIG, **kwargs)
+
+
+class ValidationError(SQLServerMCPError):
+    """Erro de validação de entrada."""
+    
+    def __init__(self, message: str, **kwargs):
+        super().__init__(message, code=ErrorCode.VALIDATION_ERROR, **kwargs)
+
+
+class SecurityError(SQLServerMCPError):
+    """Erro de segurança (query bloqueada)."""
+    
+    def __init__(self, message: str, **kwargs):
+        super().__init__(message, code=ErrorCode.SECURITY_VIOLATION, **kwargs)
+
+
+class QueryError(SQLServerMCPError):
+    """Erro na execução de query."""
+    
+    def __init__(self, message: str, **kwargs):
+        super().__init__(message, code=ErrorCode.QUERY_ERROR, **kwargs)
+
+
+# Mapeamento de códigos de erro do SQL Server para mensagens amigáveis
+SQL_ERROR_MESSAGES: Dict[str, tuple[ErrorCode, str]] = {
+    # Erros de conexão
+    "08001": (ErrorCode.CONNECTION_FAILED, "Não foi possível conectar ao servidor SQL Server"),
+    "08S01": (ErrorCode.CONNECTION_FAILED, "Conexão perdida com o servidor"),
+    "HYT00": (ErrorCode.CONNECTION_TIMEOUT, "Timeout na conexão com o servidor"),
+    "HYT01": (ErrorCode.CONNECTION_TIMEOUT, "Timeout na conexão expirado"),
+    
+    # Erros de autenticação
+    "28000": (ErrorCode.CONNECTION_FAILED, "Falha na autenticação. Verifique usuário e senha"),
+    "18456": (ErrorCode.CONNECTION_FAILED, "Login falhou. Usuário ou senha incorretos"),
+    
+    # Erros de permissão
+    "42000": (ErrorCode.PERMISSION_DENIED, "Permissão negada para executar esta operação"),
+    
+    # Erros de objeto não encontrado
+    "42S02": (ErrorCode.TABLE_NOT_FOUND, "Tabela ou view não encontrada"),
+    "42S22": (ErrorCode.COLUMN_NOT_FOUND, "Coluna não encontrada"),
+    
+    # Erros de sintaxe
+    "42S01": (ErrorCode.QUERY_ERROR, "Objeto já existe no banco de dados"),
+    "37000": (ErrorCode.QUERY_ERROR, "Erro de sintaxe na query SQL"),
+}
+
+
+def _parse_pyodbc_error(error: pyodbc.Error) -> tuple[ErrorCode, str, Dict[str, Any]]:
+    """Extrai informações estruturadas de um erro pyodbc."""
+    error_args = error.args
+    
+    if len(error_args) >= 2:
+        sqlstate = error_args[0]
+        message = error_args[1]
+    else:
+        sqlstate = "UNKNOWN"
+        message = str(error)
+    
+    # Tenta extrair o código de erro do SQL Server da mensagem
+    sql_error_code = None
+    if "[SQL Server]" in message:
+        # Formato típico: [SQL Server]Mensagem (código)
+        import re as regex
+        match = regex.search(r"\((\d+)\)", message)
+        if match:
+            sql_error_code = match.group(1)
+    
+    # Busca mensagem amigável no mapeamento
+    if sqlstate in SQL_ERROR_MESSAGES:
+        code, friendly_message = SQL_ERROR_MESSAGES[sqlstate]
+    elif sql_error_code and sql_error_code in SQL_ERROR_MESSAGES:
+        code, friendly_message = SQL_ERROR_MESSAGES[sql_error_code]
+    else:
+        code = ErrorCode.QUERY_ERROR
+        friendly_message = "Erro ao executar operação no banco de dados"
+    
+    details = {
+        "sqlstate": sqlstate,
+        "original_message": message,
+    }
+    if sql_error_code:
+        details["sql_error_code"] = sql_error_code
+    
+    return code, friendly_message, details
+
+
+# Type variable para o decorator
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def handle_errors(func: F) -> F:
+    """Decorator para tratamento padronizado de erros nas ferramentas MCP."""
+    
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        
+        except SQLServerMCPError:
+            # Já é um erro customizado, apenas re-lança
+            raise
+        
+        except pyodbc.Error as e:
+            # Converte erro pyodbc para erro customizado
+            code, message, details = _parse_pyodbc_error(e)
+            logger.error(f"Erro pyodbc em {func.__name__}: {e}")
+            raise SQLServerMCPError(
+                message=message,
+                code=code,
+                details=details,
+                original_error=e,
+            )
+        
+        except ValueError as e:
+            # Erros de validação
+            logger.warning(f"Erro de validação em {func.__name__}: {e}")
+            raise ValidationError(
+                message=str(e),
+                original_error=e,
+            )
+        
+        except Exception as e:
+            # Erro inesperado
+            logger.exception(f"Erro inesperado em {func.__name__}: {e}")
+            raise SQLServerMCPError(
+                message=f"Erro interno: {str(e)}",
+                code=ErrorCode.INTERNAL_ERROR,
+                original_error=e,
+            )
+    
+    return wrapper  # type: ignore
+
 
 # ============================================================================
 # CONFIGURAÇÃO DE LOGGING
@@ -54,7 +263,10 @@ def _build_connection_string() -> str:
     driver = os.getenv("SQLSERVER_DRIVER", "ODBC Driver 18 for SQL Server")
     server = os.getenv("SQLSERVER_SERVER")
     if not server:
-        raise ValueError("A variável de ambiente SQLSERVER_SERVER é obrigatória")
+        raise ConfigurationError(
+            "A variável de ambiente SQLSERVER_SERVER é obrigatória",
+            details={"missing_var": "SQLSERVER_SERVER"},
+        )
 
     port = os.getenv("SQLSERVER_PORT")
     server_part = f"{server},{port}" if port else server
@@ -81,8 +293,10 @@ def _build_connection_string() -> str:
         parts.append("Trusted_Connection=yes")
     else:
         if not username or not password:
-            raise ValueError(
-                "Defina SQLSERVER_USERNAME e SQLSERVER_PASSWORD ou habilite SQLSERVER_TRUSTED_CONNECTION=yes"
+            raise ConfigurationError(
+                "Credenciais não configuradas. Defina SQLSERVER_USERNAME e SQLSERVER_PASSWORD "
+                "ou habilite SQLSERVER_TRUSTED_CONNECTION=yes",
+                details={"missing_vars": ["SQLSERVER_USERNAME", "SQLSERVER_PASSWORD"]},
             )
         parts.append(f"UID={username}")
         parts.append(f"PWD={password}")
@@ -281,86 +495,78 @@ def _rows_to_dicts(cursor: pyodbc.Cursor, rows: List[Any]) -> List[Dict[str, Any
 
 
 @app.tool()
+@handle_errors
 def test_connection() -> Dict[str, Any]:
     """Valida a conexão com o SQL Server e retorna informações básicas do servidor."""
     logger.info("Executando test_connection")
     start_time = time.perf_counter()
-    try:
-        with get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT @@VERSION AS version, DB_NAME() AS current_database;")
-                result = _rows_to_dicts(cur, cur.fetchall())
-                elapsed = (time.perf_counter() - start_time) * 1000
-                logger.info(f"test_connection concluído em {elapsed:.2f}ms")
-                return result[0] if result else {}
-    except Exception as e:
-        elapsed = (time.perf_counter() - start_time) * 1000
-        logger.error(f"test_connection falhou após {elapsed:.2f}ms: {e}")
-        raise
+    
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT @@VERSION AS version, DB_NAME() AS current_database;")
+            result = _rows_to_dicts(cur, cur.fetchall())
+            elapsed = (time.perf_counter() - start_time) * 1000
+            logger.info(f"test_connection concluído em {elapsed:.2f}ms")
+            return result[0] if result else {}
 
 
 @app.tool()
+@handle_errors
 def list_schemas() -> List[str]:
     """Lista schemas disponíveis no banco atual."""
     logger.info("Executando list_schemas")
     start_time = time.perf_counter()
-    try:
-        with get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT DISTINCT TABLE_SCHEMA
-                    FROM INFORMATION_SCHEMA.TABLES
-                    ORDER BY TABLE_SCHEMA
-                    """
-                )
-                rows = [r[0] for r in cur.fetchall()]
-                elapsed = (time.perf_counter() - start_time) * 1000
-                logger.info(f"list_schemas retornou {len(rows)} schemas em {elapsed:.2f}ms")
-                return rows
-    except Exception as e:
-        elapsed = (time.perf_counter() - start_time) * 1000
-        logger.error(f"list_schemas falhou após {elapsed:.2f}ms: {e}")
-        raise
+    
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT TABLE_SCHEMA
+                FROM INFORMATION_SCHEMA.TABLES
+                ORDER BY TABLE_SCHEMA
+                """
+            )
+            rows = [r[0] for r in cur.fetchall()]
+            elapsed = (time.perf_counter() - start_time) * 1000
+            logger.info(f"list_schemas retornou {len(rows)} schemas em {elapsed:.2f}ms")
+            return rows
 
 
 @app.tool()
+@handle_errors
 def list_tables(schema: Optional[str] = None) -> List[Dict[str, Any]]:
     """Lista tabelas. Se schema for informado, filtra por ele."""
     logger.info(f"Executando list_tables (schema={schema})")
     start_time = time.perf_counter()
-    try:
-        with get_connection() as conn:
-            with conn.cursor() as cur:
-                if schema:
-                    cur.execute(
-                        """
-                        SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
-                        FROM INFORMATION_SCHEMA.TABLES
-                        WHERE TABLE_SCHEMA = ?
-                        ORDER BY TABLE_SCHEMA, TABLE_NAME
-                        """,
-                        (schema,),
-                    )
-                else:
-                    cur.execute(
-                        """
-                        SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
-                        FROM INFORMATION_SCHEMA.TABLES
-                        ORDER BY TABLE_SCHEMA, TABLE_NAME
-                        """
-                    )
-                result = _rows_to_dicts(cur, cur.fetchall())
-                elapsed = (time.perf_counter() - start_time) * 1000
-                logger.info(f"list_tables retornou {len(result)} tabelas em {elapsed:.2f}ms")
-                return result
-    except Exception as e:
-        elapsed = (time.perf_counter() - start_time) * 1000
-        logger.error(f"list_tables falhou após {elapsed:.2f}ms: {e}")
-        raise
+    
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            if schema:
+                cur.execute(
+                    """
+                    SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
+                    FROM INFORMATION_SCHEMA.TABLES
+                    WHERE TABLE_SCHEMA = ?
+                    ORDER BY TABLE_SCHEMA, TABLE_NAME
+                    """,
+                    (schema,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
+                    FROM INFORMATION_SCHEMA.TABLES
+                    ORDER BY TABLE_SCHEMA, TABLE_NAME
+                    """
+                )
+            result = _rows_to_dicts(cur, cur.fetchall())
+            elapsed = (time.perf_counter() - start_time) * 1000
+            logger.info(f"list_tables retornou {len(result)} tabelas em {elapsed:.2f}ms")
+            return result
 
 
 @app.tool()
+@handle_errors
 def describe_table(table_name: str, schema: Optional[str] = None) -> List[Dict[str, Any]]:
     """Descreve colunas de uma tabela.
 
@@ -370,59 +576,65 @@ def describe_table(table_name: str, schema: Optional[str] = None) -> List[Dict[s
     logger.info(f"Executando describe_table (table={table_name}, schema={schema})")
     
     if not table_name:
-        logger.warning("describe_table chamado sem table_name")
-        raise ValueError("'table_name' é obrigatório")
+        raise ValidationError(
+            "O parâmetro 'table_name' é obrigatório",
+            details={"parameter": "table_name"},
+        )
 
     start_time = time.perf_counter()
-    try:
-        with get_connection() as conn:
-            with conn.cursor() as cur:
-                if schema:
-                    cur.execute(
-                        """
-                        SELECT
-                            c.TABLE_SCHEMA,
-                            c.TABLE_NAME,
-                            c.COLUMN_NAME,
-                            c.ORDINAL_POSITION,
-                            c.DATA_TYPE,
-                            c.CHARACTER_MAXIMUM_LENGTH,
-                            c.NUMERIC_PRECISION,
-                            c.NUMERIC_SCALE,
-                            c.IS_NULLABLE
-                        FROM INFORMATION_SCHEMA.COLUMNS c
-                        WHERE c.TABLE_SCHEMA = ? AND c.TABLE_NAME = ?
-                        ORDER BY c.ORDINAL_POSITION
-                        """,
-                        (schema, table_name),
-                    )
-                else:
-                    cur.execute(
-                        """
-                        SELECT
-                            c.TABLE_SCHEMA,
-                            c.TABLE_NAME,
-                            c.COLUMN_NAME,
-                            c.ORDINAL_POSITION,
-                            c.DATA_TYPE,
-                            c.CHARACTER_MAXIMUM_LENGTH,
-                            c.NUMERIC_PRECISION,
-                            c.NUMERIC_SCALE,
-                            c.IS_NULLABLE
-                        FROM INFORMATION_SCHEMA.COLUMNS c
-                        WHERE c.TABLE_NAME = ?
-                        ORDER BY c.TABLE_SCHEMA, c.ORDINAL_POSITION
-                        """,
-                        (table_name,),
-                    )
-                result = _rows_to_dicts(cur, cur.fetchall())
-                elapsed = (time.perf_counter() - start_time) * 1000
-                logger.info(f"describe_table retornou {len(result)} colunas em {elapsed:.2f}ms")
-                return result
-    except Exception as e:
-        elapsed = (time.perf_counter() - start_time) * 1000
-        logger.error(f"describe_table falhou após {elapsed:.2f}ms: {e}")
-        raise
+    
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            if schema:
+                cur.execute(
+                    """
+                    SELECT
+                        c.TABLE_SCHEMA,
+                        c.TABLE_NAME,
+                        c.COLUMN_NAME,
+                        c.ORDINAL_POSITION,
+                        c.DATA_TYPE,
+                        c.CHARACTER_MAXIMUM_LENGTH,
+                        c.NUMERIC_PRECISION,
+                        c.NUMERIC_SCALE,
+                        c.IS_NULLABLE
+                    FROM INFORMATION_SCHEMA.COLUMNS c
+                    WHERE c.TABLE_SCHEMA = ? AND c.TABLE_NAME = ?
+                    ORDER BY c.ORDINAL_POSITION
+                    """,
+                    (schema, table_name),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT
+                        c.TABLE_SCHEMA,
+                        c.TABLE_NAME,
+                        c.COLUMN_NAME,
+                        c.ORDINAL_POSITION,
+                        c.DATA_TYPE,
+                        c.CHARACTER_MAXIMUM_LENGTH,
+                        c.NUMERIC_PRECISION,
+                        c.NUMERIC_SCALE,
+                        c.IS_NULLABLE
+                    FROM INFORMATION_SCHEMA.COLUMNS c
+                    WHERE c.TABLE_NAME = ?
+                    ORDER BY c.TABLE_SCHEMA, c.ORDINAL_POSITION
+                    """,
+                    (table_name,),
+                )
+            result = _rows_to_dicts(cur, cur.fetchall())
+            
+            if not result:
+                raise SQLServerMCPError(
+                    f"Tabela '{table_name}' não encontrada" + (f" no schema '{schema}'" if schema else ""),
+                    code=ErrorCode.TABLE_NOT_FOUND,
+                    details={"table_name": table_name, "schema": schema},
+                )
+            
+            elapsed = (time.perf_counter() - start_time) * 1000
+            logger.info(f"describe_table retornou {len(result)} colunas em {elapsed:.2f}ms")
+            return result
 
 
 # Padrão para validar que a query começa com SELECT ou WITH
@@ -444,40 +656,45 @@ def _validate_readonly_query(sql: str) -> None:
     """Valida que a query é segura para execução read-only.
     
     Raises:
-        ValueError: Se a query contiver comandos perigosos ou padrões suspeitos.
+        ValidationError: Se a query estiver vazia.
+        SecurityError: Se a query contiver comandos perigosos ou padrões suspeitos.
     """
     if not sql or not sql.strip():
         logger.warning("Tentativa de executar query vazia")
-        raise ValueError("A consulta SQL não pode estar vazia")
+        raise ValidationError("A consulta SQL não pode estar vazia")
     
     # Verifica se começa com SELECT ou WITH
     if not _SAFE_SELECT_PATTERN.search(sql):
         logger.warning(f"Query bloqueada - não começa com SELECT/WITH: {sql[:100]}...")
-        raise ValueError("Apenas consultas de leitura são permitidas (deve iniciar com SELECT ou WITH)")
+        raise SecurityError(
+            "Apenas consultas de leitura são permitidas (deve iniciar com SELECT ou WITH)",
+            details={"query_preview": sql[:100]},
+        )
     
     # Bloqueia palavras-chave perigosas
     dangerous_match = _DANGEROUS_KEYWORDS.search(sql)
     if dangerous_match:
-        logger.warning(
-            f"Query bloqueada - palavra-chave perigosa '{dangerous_match.group()}': {sql[:100]}..."
-        )
-        raise ValueError(
-            f"Comando não permitido detectado: '{dangerous_match.group()}'. "
-            "Apenas consultas SELECT/WITH são permitidas."
+        keyword = dangerous_match.group()
+        logger.warning(f"Query bloqueada - palavra-chave perigosa '{keyword}': {sql[:100]}...")
+        raise SecurityError(
+            f"Comando não permitido detectado: '{keyword}'. "
+            "Apenas consultas SELECT/WITH são permitidas.",
+            details={"blocked_keyword": keyword, "query_preview": sql[:100]},
         )
     
     # Bloqueia múltiplos statements (previne SQL injection com ;)
     if _MULTI_STATEMENT_PATTERN.search(sql):
         logger.warning(f"Query bloqueada - múltiplos statements detectados: {sql[:100]}...")
-        raise ValueError(
-            "Múltiplos statements não são permitidos. "
-            "Execute apenas uma consulta SELECT por vez."
+        raise SecurityError(
+            "Múltiplos statements não são permitidos. Execute apenas uma consulta SELECT por vez.",
+            details={"reason": "multiple_statements", "query_preview": sql[:100]},
         )
     
     logger.debug("Query passou na validação de segurança")
 
 
 @app.tool()
+@handle_errors
 def run_query(sql: str, max_rows: int = 1000) -> List[Dict[str, Any]]:
     """Executa uma consulta somente-LEITURA (SELECT/CTE). Limita o número de linhas retornadas.
 
@@ -501,30 +718,27 @@ def run_query(sql: str, max_rows: int = 1000) -> List[Dict[str, Any]]:
         max_rows = 1000
 
     start_time = time.perf_counter()
-    try:
-        with get_connection() as conn:
-            # Desabilita autocommit para controlar a transação manualmente
-            conn.autocommit = False
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(sql)
-                    rows = cur.fetchmany(max_rows)
-                    result = _rows_to_dicts(cur, rows)
-            finally:
-                # SEMPRE faz rollback - mesmo para SELECT, garante que nada seja persistido
-                # caso algum comando malicioso passe pela validação
-                conn.rollback()
-            
-            elapsed = (time.perf_counter() - start_time) * 1000
-            logger.info(f"run_query retornou {len(result)} linhas em {elapsed:.2f}ms")
-            return result
-    except Exception as e:
+    
+    with get_connection() as conn:
+        # Desabilita autocommit para controlar a transação manualmente
+        conn.autocommit = False
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchmany(max_rows)
+                result = _rows_to_dicts(cur, rows)
+        finally:
+            # SEMPRE faz rollback - mesmo para SELECT, garante que nada seja persistido
+            # caso algum comando malicioso passe pela validação
+            conn.rollback()
+        
         elapsed = (time.perf_counter() - start_time) * 1000
-        logger.error(f"run_query falhou após {elapsed:.2f}ms: {e}")
-        raise
+        logger.info(f"run_query retornou {len(result)} linhas em {elapsed:.2f}ms")
+        return result
 
 
 @app.tool()
+@handle_errors
 def pool_stats() -> Dict[str, Any]:
     """Retorna estatísticas do pool de conexões.
     
