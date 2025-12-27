@@ -737,6 +737,444 @@ def run_query(sql: str, max_rows: int = 1000) -> List[Dict[str, Any]]:
         return result
 
 
+# ============================================================================
+# NOVAS FERRAMENTAS: VIEWS, PROCEDURES, INDEXES, FOREIGN KEYS
+# ============================================================================
+
+@app.tool()
+@handle_errors
+def list_views(schema: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Lista views do banco de dados.
+    
+    - schema: filtra por schema específico (opcional)
+    """
+    logger.info(f"Executando list_views (schema={schema})")
+    start_time = time.perf_counter()
+    
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            if schema:
+                cur.execute(
+                    """
+                    SELECT 
+                        TABLE_SCHEMA AS view_schema,
+                        TABLE_NAME AS view_name,
+                        VIEW_DEFINITION AS definition
+                    FROM INFORMATION_SCHEMA.VIEWS
+                    WHERE TABLE_SCHEMA = ?
+                    ORDER BY TABLE_SCHEMA, TABLE_NAME
+                    """,
+                    (schema,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT 
+                        TABLE_SCHEMA AS view_schema,
+                        TABLE_NAME AS view_name,
+                        VIEW_DEFINITION AS definition
+                    FROM INFORMATION_SCHEMA.VIEWS
+                    ORDER BY TABLE_SCHEMA, TABLE_NAME
+                    """
+                )
+            result = _rows_to_dicts(cur, cur.fetchall())
+            elapsed = (time.perf_counter() - start_time) * 1000
+            logger.info(f"list_views retornou {len(result)} views em {elapsed:.2f}ms")
+            return result
+
+
+@app.tool()
+@handle_errors
+def list_procedures(schema: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Lista stored procedures do banco de dados.
+    
+    - schema: filtra por schema específico (opcional)
+    """
+    logger.info(f"Executando list_procedures (schema={schema})")
+    start_time = time.perf_counter()
+    
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            if schema:
+                cur.execute(
+                    """
+                    SELECT 
+                        ROUTINE_SCHEMA AS procedure_schema,
+                        ROUTINE_NAME AS procedure_name,
+                        ROUTINE_TYPE AS type,
+                        CREATED AS created_date,
+                        LAST_ALTERED AS last_modified_date
+                    FROM INFORMATION_SCHEMA.ROUTINES
+                    WHERE ROUTINE_TYPE = 'PROCEDURE' AND ROUTINE_SCHEMA = ?
+                    ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME
+                    """,
+                    (schema,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT 
+                        ROUTINE_SCHEMA AS procedure_schema,
+                        ROUTINE_NAME AS procedure_name,
+                        ROUTINE_TYPE AS type,
+                        CREATED AS created_date,
+                        LAST_ALTERED AS last_modified_date
+                    FROM INFORMATION_SCHEMA.ROUTINES
+                    WHERE ROUTINE_TYPE = 'PROCEDURE'
+                    ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME
+                    """
+                )
+            result = _rows_to_dicts(cur, cur.fetchall())
+            elapsed = (time.perf_counter() - start_time) * 1000
+            logger.info(f"list_procedures retornou {len(result)} procedures em {elapsed:.2f}ms")
+            return result
+
+
+@app.tool()
+@handle_errors
+def list_functions(schema: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Lista funções definidas pelo usuário no banco de dados.
+    
+    - schema: filtra por schema específico (opcional)
+    """
+    logger.info(f"Executando list_functions (schema={schema})")
+    start_time = time.perf_counter()
+    
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            if schema:
+                cur.execute(
+                    """
+                    SELECT 
+                        ROUTINE_SCHEMA AS function_schema,
+                        ROUTINE_NAME AS function_name,
+                        DATA_TYPE AS return_type,
+                        CREATED AS created_date,
+                        LAST_ALTERED AS last_modified_date
+                    FROM INFORMATION_SCHEMA.ROUTINES
+                    WHERE ROUTINE_TYPE = 'FUNCTION' AND ROUTINE_SCHEMA = ?
+                    ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME
+                    """,
+                    (schema,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT 
+                        ROUTINE_SCHEMA AS function_schema,
+                        ROUTINE_NAME AS function_name,
+                        DATA_TYPE AS return_type,
+                        CREATED AS created_date,
+                        LAST_ALTERED AS last_modified_date
+                    FROM INFORMATION_SCHEMA.ROUTINES
+                    WHERE ROUTINE_TYPE = 'FUNCTION'
+                    ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME
+                    """
+                )
+            result = _rows_to_dicts(cur, cur.fetchall())
+            elapsed = (time.perf_counter() - start_time) * 1000
+            logger.info(f"list_functions retornou {len(result)} functions em {elapsed:.2f}ms")
+            return result
+
+
+@app.tool()
+@handle_errors
+def get_indexes(table_name: str, schema: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Retorna os índices de uma tabela.
+    
+    - table_name: nome da tabela (obrigatório)
+    - schema: schema da tabela (opcional, padrão: dbo)
+    """
+    logger.info(f"Executando get_indexes (table={table_name}, schema={schema})")
+    
+    if not table_name:
+        raise ValidationError(
+            "O parâmetro 'table_name' é obrigatório",
+            details={"parameter": "table_name"},
+        )
+    
+    start_time = time.perf_counter()
+    schema_filter = schema or "dbo"
+    
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 
+                    s.name AS schema_name,
+                    t.name AS table_name,
+                    i.name AS index_name,
+                    i.type_desc AS index_type,
+                    i.is_unique,
+                    i.is_primary_key,
+                    i.is_unique_constraint,
+                    STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY ic.key_ordinal) AS columns,
+                    i.fill_factor
+                FROM sys.indexes i
+                INNER JOIN sys.tables t ON i.object_id = t.object_id
+                INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+                INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+                INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                WHERE t.name = ? AND s.name = ? AND i.name IS NOT NULL
+                GROUP BY s.name, t.name, i.name, i.type_desc, i.is_unique, 
+                         i.is_primary_key, i.is_unique_constraint, i.fill_factor
+                ORDER BY i.is_primary_key DESC, i.name
+                """,
+                (table_name, schema_filter),
+            )
+            result = _rows_to_dicts(cur, cur.fetchall())
+            elapsed = (time.perf_counter() - start_time) * 1000
+            logger.info(f"get_indexes retornou {len(result)} índices em {elapsed:.2f}ms")
+            return result
+
+
+@app.tool()
+@handle_errors
+def get_foreign_keys(table_name: str, schema: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Retorna as chaves estrangeiras (foreign keys) de uma tabela.
+    
+    - table_name: nome da tabela (obrigatório)
+    - schema: schema da tabela (opcional, padrão: dbo)
+    """
+    logger.info(f"Executando get_foreign_keys (table={table_name}, schema={schema})")
+    
+    if not table_name:
+        raise ValidationError(
+            "O parâmetro 'table_name' é obrigatório",
+            details={"parameter": "table_name"},
+        )
+    
+    start_time = time.perf_counter()
+    schema_filter = schema or "dbo"
+    
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 
+                    fk.name AS constraint_name,
+                    s1.name AS table_schema,
+                    t1.name AS table_name,
+                    c1.name AS column_name,
+                    s2.name AS referenced_schema,
+                    t2.name AS referenced_table,
+                    c2.name AS referenced_column,
+                    fk.delete_referential_action_desc AS on_delete,
+                    fk.update_referential_action_desc AS on_update
+                FROM sys.foreign_keys fk
+                INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
+                INNER JOIN sys.tables t1 ON fkc.parent_object_id = t1.object_id
+                INNER JOIN sys.schemas s1 ON t1.schema_id = s1.schema_id
+                INNER JOIN sys.columns c1 ON fkc.parent_object_id = c1.object_id 
+                    AND fkc.parent_column_id = c1.column_id
+                INNER JOIN sys.tables t2 ON fkc.referenced_object_id = t2.object_id
+                INNER JOIN sys.schemas s2 ON t2.schema_id = s2.schema_id
+                INNER JOIN sys.columns c2 ON fkc.referenced_object_id = c2.object_id 
+                    AND fkc.referenced_column_id = c2.column_id
+                WHERE t1.name = ? AND s1.name = ?
+                ORDER BY fk.name, fkc.constraint_column_id
+                """,
+                (table_name, schema_filter),
+            )
+            result = _rows_to_dicts(cur, cur.fetchall())
+            elapsed = (time.perf_counter() - start_time) * 1000
+            logger.info(f"get_foreign_keys retornou {len(result)} FKs em {elapsed:.2f}ms")
+            return result
+
+
+@app.tool()
+@handle_errors
+def get_primary_key(table_name: str, schema: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Retorna a chave primária (primary key) de uma tabela.
+    
+    - table_name: nome da tabela (obrigatório)
+    - schema: schema da tabela (opcional, padrão: dbo)
+    """
+    logger.info(f"Executando get_primary_key (table={table_name}, schema={schema})")
+    
+    if not table_name:
+        raise ValidationError(
+            "O parâmetro 'table_name' é obrigatório",
+            details={"parameter": "table_name"},
+        )
+    
+    start_time = time.perf_counter()
+    schema_filter = schema or "dbo"
+    
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 
+                    kcu.CONSTRAINT_NAME AS constraint_name,
+                    kcu.TABLE_SCHEMA AS table_schema,
+                    kcu.TABLE_NAME AS table_name,
+                    kcu.COLUMN_NAME AS column_name,
+                    kcu.ORDINAL_POSITION AS ordinal_position
+                FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+                INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu 
+                    ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+                    AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA
+                WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+                    AND tc.TABLE_NAME = ?
+                    AND tc.TABLE_SCHEMA = ?
+                ORDER BY kcu.ORDINAL_POSITION
+                """,
+                (table_name, schema_filter),
+            )
+            result = _rows_to_dicts(cur, cur.fetchall())
+            elapsed = (time.perf_counter() - start_time) * 1000
+            logger.info(f"get_primary_key retornou {len(result)} colunas em {elapsed:.2f}ms")
+            return result
+
+
+@app.tool()
+@handle_errors
+def get_table_row_count(table_name: str, schema: Optional[str] = None) -> Dict[str, Any]:
+    """Retorna a contagem aproximada de linhas de uma tabela.
+    
+    Usa estatísticas do SQL Server para uma contagem rápida (aproximada).
+    Para contagem exata, use run_query com SELECT COUNT(*).
+    
+    - table_name: nome da tabela (obrigatório)
+    - schema: schema da tabela (opcional, padrão: dbo)
+    """
+    logger.info(f"Executando get_table_row_count (table={table_name}, schema={schema})")
+    
+    if not table_name:
+        raise ValidationError(
+            "O parâmetro 'table_name' é obrigatório",
+            details={"parameter": "table_name"},
+        )
+    
+    start_time = time.perf_counter()
+    schema_filter = schema or "dbo"
+    
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 
+                    s.name AS schema_name,
+                    t.name AS table_name,
+                    SUM(p.rows) AS approximate_row_count,
+                    SUM(a.total_pages) * 8 AS total_space_kb,
+                    SUM(a.used_pages) * 8 AS used_space_kb
+                FROM sys.tables t
+                INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+                INNER JOIN sys.partitions p ON t.object_id = p.object_id
+                INNER JOIN sys.allocation_units a ON p.partition_id = a.container_id
+                WHERE t.name = ? AND s.name = ? AND p.index_id IN (0, 1)
+                GROUP BY s.name, t.name
+                """,
+                (table_name, schema_filter),
+            )
+            result = _rows_to_dicts(cur, cur.fetchall())
+            
+            if not result:
+                raise SQLServerMCPError(
+                    f"Tabela '{table_name}' não encontrada no schema '{schema_filter}'",
+                    code=ErrorCode.TABLE_NOT_FOUND,
+                    details={"table_name": table_name, "schema": schema_filter},
+                )
+            
+            elapsed = (time.perf_counter() - start_time) * 1000
+            logger.info(f"get_table_row_count concluído em {elapsed:.2f}ms")
+            return result[0]
+
+
+@app.tool()
+@handle_errors
+def get_table_relationships(table_name: str, schema: Optional[str] = None) -> Dict[str, Any]:
+    """Retorna todos os relacionamentos de uma tabela (FK de saída e entrada).
+    
+    - table_name: nome da tabela (obrigatório)
+    - schema: schema da tabela (opcional, padrão: dbo)
+    
+    Retorna:
+    - outgoing_fks: chaves estrangeiras que SAEM desta tabela (esta tabela referencia outras)
+    - incoming_fks: chaves estrangeiras que ENTRAM nesta tabela (outras tabelas referenciam esta)
+    """
+    logger.info(f"Executando get_table_relationships (table={table_name}, schema={schema})")
+    
+    if not table_name:
+        raise ValidationError(
+            "O parâmetro 'table_name' é obrigatório",
+            details={"parameter": "table_name"},
+        )
+    
+    start_time = time.perf_counter()
+    schema_filter = schema or "dbo"
+    
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            # FKs que SAEM desta tabela (esta tabela referencia outras)
+            cur.execute(
+                """
+                SELECT 
+                    fk.name AS constraint_name,
+                    c1.name AS column_name,
+                    s2.name AS referenced_schema,
+                    t2.name AS referenced_table,
+                    c2.name AS referenced_column
+                FROM sys.foreign_keys fk
+                INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
+                INNER JOIN sys.tables t1 ON fkc.parent_object_id = t1.object_id
+                INNER JOIN sys.schemas s1 ON t1.schema_id = s1.schema_id
+                INNER JOIN sys.columns c1 ON fkc.parent_object_id = c1.object_id 
+                    AND fkc.parent_column_id = c1.column_id
+                INNER JOIN sys.tables t2 ON fkc.referenced_object_id = t2.object_id
+                INNER JOIN sys.schemas s2 ON t2.schema_id = s2.schema_id
+                INNER JOIN sys.columns c2 ON fkc.referenced_object_id = c2.object_id 
+                    AND fkc.referenced_column_id = c2.column_id
+                WHERE t1.name = ? AND s1.name = ?
+                ORDER BY fk.name
+                """,
+                (table_name, schema_filter),
+            )
+            outgoing = _rows_to_dicts(cur, cur.fetchall())
+            
+            # FKs que ENTRAM nesta tabela (outras tabelas referenciam esta)
+            cur.execute(
+                """
+                SELECT 
+                    fk.name AS constraint_name,
+                    s1.name AS referencing_schema,
+                    t1.name AS referencing_table,
+                    c1.name AS referencing_column,
+                    c2.name AS column_name
+                FROM sys.foreign_keys fk
+                INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
+                INNER JOIN sys.tables t1 ON fkc.parent_object_id = t1.object_id
+                INNER JOIN sys.schemas s1 ON t1.schema_id = s1.schema_id
+                INNER JOIN sys.columns c1 ON fkc.parent_object_id = c1.object_id 
+                    AND fkc.parent_column_id = c1.column_id
+                INNER JOIN sys.tables t2 ON fkc.referenced_object_id = t2.object_id
+                INNER JOIN sys.schemas s2 ON t2.schema_id = s2.schema_id
+                INNER JOIN sys.columns c2 ON fkc.referenced_object_id = c2.object_id 
+                    AND fkc.referenced_column_id = c2.column_id
+                WHERE t2.name = ? AND s2.name = ?
+                ORDER BY fk.name
+                """,
+                (table_name, schema_filter),
+            )
+            incoming = _rows_to_dicts(cur, cur.fetchall())
+            
+            elapsed = (time.perf_counter() - start_time) * 1000
+            logger.info(
+                f"get_table_relationships retornou {len(outgoing)} saída, "
+                f"{len(incoming)} entrada em {elapsed:.2f}ms"
+            )
+            
+            return {
+                "table_name": table_name,
+                "schema": schema_filter,
+                "outgoing_fks": outgoing,
+                "incoming_fks": incoming,
+                "total_relationships": len(outgoing) + len(incoming),
+            }
+
+
 @app.tool()
 @handle_errors
 def pool_stats() -> Dict[str, Any]:
