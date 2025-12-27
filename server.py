@@ -1,8 +1,11 @@
+import atexit
 import logging
 import os
 import re
+import threading
 import time
-from typing import Any, Dict, List, Optional
+from contextlib import contextmanager
+from typing import Any, Dict, Generator, List, Optional
 
 import pyodbc
 from dotenv import load_dotenv
@@ -87,19 +90,189 @@ def _build_connection_string() -> str:
     return ";".join(parts)
 
 
-def _open_connection() -> pyodbc.Connection:
-    """Abre uma conexão com o SQL Server."""
+# ============================================================================
+# CONNECTION POOL
+# ============================================================================
+class ConnectionPool:
+    """Pool de conexões para reutilização eficiente.
+    
+    Mantém conexões abertas para evitar overhead de reconexão a cada chamada.
+    Thread-safe para uso em ambientes concorrentes.
+    """
+    
+    def __init__(self, max_size: int = 5, max_idle_time: int = 300):
+        """
+        Args:
+            max_size: Número máximo de conexões no pool
+            max_idle_time: Tempo máximo (segundos) que uma conexão pode ficar ociosa
+        """
+        self._max_size = max_size
+        self._max_idle_time = max_idle_time
+        self._pool: List[tuple[pyodbc.Connection, float]] = []  # (conn, last_used_time)
+        self._lock = threading.Lock()
+        self._connection_string: Optional[str] = None
+        self._total_created = 0
+        self._total_reused = 0
+        
+        logger.info(f"ConnectionPool inicializado (max_size={max_size}, max_idle_time={max_idle_time}s)")
+    
+    def _create_connection(self) -> pyodbc.Connection:
+        """Cria uma nova conexão com o banco."""
+        if self._connection_string is None:
+            self._connection_string = _build_connection_string()
+        
+        start_time = time.perf_counter()
+        conn = pyodbc.connect(self._connection_string, timeout=10)
+        elapsed = (time.perf_counter() - start_time) * 1000
+        
+        self._total_created += 1
+        logger.debug(f"Nova conexão criada em {elapsed:.2f}ms (total criadas: {self._total_created})")
+        
+        return conn
+    
+    def _is_connection_valid(self, conn: pyodbc.Connection) -> bool:
+        """Verifica se a conexão ainda está ativa."""
+        try:
+            # Executa uma query simples para verificar a conexão
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1")
+            cursor.close()
+            return True
+        except pyodbc.Error:
+            return False
+    
+    def _cleanup_expired(self) -> None:
+        """Remove conexões expiradas do pool."""
+        current_time = time.time()
+        expired = []
+        
+        for i, (conn, last_used) in enumerate(self._pool):
+            if current_time - last_used > self._max_idle_time:
+                expired.append(i)
+        
+        # Remove do fim para o início para não bagunçar os índices
+        for i in reversed(expired):
+            conn, _ = self._pool.pop(i)
+            try:
+                conn.close()
+                logger.debug(f"Conexão expirada removida do pool (idle > {self._max_idle_time}s)")
+            except pyodbc.Error:
+                pass
+    
+    def get_connection(self) -> pyodbc.Connection:
+        """Obtém uma conexão do pool ou cria uma nova."""
+        with self._lock:
+            self._cleanup_expired()
+            
+            # Tenta reutilizar uma conexão do pool
+            while self._pool:
+                conn, last_used = self._pool.pop()
+                
+                if self._is_connection_valid(conn):
+                    self._total_reused += 1
+                    logger.debug(
+                        f"Conexão reutilizada do pool "
+                        f"(pool_size={len(self._pool)}, reusadas={self._total_reused})"
+                    )
+                    return conn
+                else:
+                    # Conexão inválida, fecha e tenta próxima
+                    try:
+                        conn.close()
+                    except pyodbc.Error:
+                        pass
+                    logger.debug("Conexão inválida descartada do pool")
+            
+            # Pool vazio, cria nova conexão
+            return self._create_connection()
+    
+    def return_connection(self, conn: pyodbc.Connection) -> None:
+        """Devolve uma conexão ao pool para reutilização."""
+        with self._lock:
+            # Se o pool está cheio, fecha a conexão
+            if len(self._pool) >= self._max_size:
+                try:
+                    conn.close()
+                    logger.debug("Pool cheio, conexão fechada")
+                except pyodbc.Error:
+                    pass
+                return
+            
+            # Verifica se a conexão ainda é válida antes de devolver
+            if self._is_connection_valid(conn):
+                self._pool.append((conn, time.time()))
+                logger.debug(f"Conexão devolvida ao pool (pool_size={len(self._pool)})")
+            else:
+                try:
+                    conn.close()
+                except pyodbc.Error:
+                    pass
+                logger.debug("Conexão inválida não devolvida ao pool")
+    
+    def close_all(self) -> None:
+        """Fecha todas as conexões do pool."""
+        with self._lock:
+            for conn, _ in self._pool:
+                try:
+                    conn.close()
+                except pyodbc.Error:
+                    pass
+            
+            closed_count = len(self._pool)
+            self._pool.clear()
+            logger.info(
+                f"Pool encerrado: {closed_count} conexões fechadas "
+                f"(total criadas: {self._total_created}, reutilizadas: {self._total_reused})"
+            )
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Retorna estatísticas do pool."""
+        with self._lock:
+            return {
+                "pool_size": len(self._pool),
+                "max_size": self._max_size,
+                "total_created": self._total_created,
+                "total_reused": self._total_reused,
+                "reuse_rate": (
+                    f"{(self._total_reused / (self._total_created + self._total_reused) * 100):.1f}%"
+                    if (self._total_created + self._total_reused) > 0
+                    else "0%"
+                ),
+            }
+
+
+# Pool global de conexões
+# Configurável via variáveis de ambiente
+POOL_MAX_SIZE = int(os.getenv("SQLSERVER_POOL_SIZE", "5"))
+POOL_MAX_IDLE_TIME = int(os.getenv("SQLSERVER_POOL_IDLE_TIME", "300"))
+
+_connection_pool = ConnectionPool(max_size=POOL_MAX_SIZE, max_idle_time=POOL_MAX_IDLE_TIME)
+
+# Registra fechamento do pool ao encerrar o processo
+atexit.register(_connection_pool.close_all)
+
+
+@contextmanager
+def get_connection() -> Generator[pyodbc.Connection, None, None]:
+    """Context manager para obter uma conexão do pool.
+    
+    Uso:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1")
+    """
+    conn = None
     start_time = time.perf_counter()
     try:
-        connection_string = _build_connection_string()
-        conn = pyodbc.connect(connection_string, timeout=10)
-        elapsed = (time.perf_counter() - start_time) * 1000
-        logger.debug(f"Conexão estabelecida em {elapsed:.2f}ms")
-        return conn
+        conn = _connection_pool.get_connection()
+        yield conn
     except pyodbc.Error as e:
         elapsed = (time.perf_counter() - start_time) * 1000
-        logger.error(f"Falha na conexão após {elapsed:.2f}ms: {e}")
+        logger.error(f"Erro de conexão após {elapsed:.2f}ms: {e}")
         raise
+    finally:
+        if conn is not None:
+            _connection_pool.return_connection(conn)
 
 
 def _rows_to_dicts(cursor: pyodbc.Cursor, rows: List[Any]) -> List[Dict[str, Any]]:
@@ -113,7 +286,7 @@ def test_connection() -> Dict[str, Any]:
     logger.info("Executando test_connection")
     start_time = time.perf_counter()
     try:
-        with _open_connection() as conn:
+        with get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT @@VERSION AS version, DB_NAME() AS current_database;")
                 result = _rows_to_dicts(cur, cur.fetchall())
@@ -132,7 +305,7 @@ def list_schemas() -> List[str]:
     logger.info("Executando list_schemas")
     start_time = time.perf_counter()
     try:
-        with _open_connection() as conn:
+        with get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -157,7 +330,7 @@ def list_tables(schema: Optional[str] = None) -> List[Dict[str, Any]]:
     logger.info(f"Executando list_tables (schema={schema})")
     start_time = time.perf_counter()
     try:
-        with _open_connection() as conn:
+        with get_connection() as conn:
             with conn.cursor() as cur:
                 if schema:
                     cur.execute(
@@ -202,7 +375,7 @@ def describe_table(table_name: str, schema: Optional[str] = None) -> List[Dict[s
 
     start_time = time.perf_counter()
     try:
-        with _open_connection() as conn:
+        with get_connection() as conn:
             with conn.cursor() as cur:
                 if schema:
                     cur.execute(
@@ -329,7 +502,7 @@ def run_query(sql: str, max_rows: int = 1000) -> List[Dict[str, Any]]:
 
     start_time = time.perf_counter()
     try:
-        with _open_connection() as conn:
+        with get_connection() as conn:
             # Desabilita autocommit para controlar a transação manualmente
             conn.autocommit = False
             try:
@@ -349,6 +522,18 @@ def run_query(sql: str, max_rows: int = 1000) -> List[Dict[str, Any]]:
         elapsed = (time.perf_counter() - start_time) * 1000
         logger.error(f"run_query falhou após {elapsed:.2f}ms: {e}")
         raise
+
+
+@app.tool()
+def pool_stats() -> Dict[str, Any]:
+    """Retorna estatísticas do pool de conexões.
+    
+    Útil para monitoramento e debug de performance.
+    """
+    logger.info("Executando pool_stats")
+    stats = _connection_pool.get_stats()
+    logger.info(f"Pool stats: {stats}")
+    return stats
 
 
 if __name__ == "__main__":
