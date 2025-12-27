@@ -18,7 +18,7 @@ Servidor MCP (Model Context Protocol) em Python para consultar Microsoft SQL Ser
 - Acesso ao servidor SQL Server
 
 ### Instalação
-1. Clone/abra este diretório `sqlserver/` na Cursor
+1. Clone/abra este diretório `sqlserver-mcp/` na sua IDE
 2. Crie o `.env` a partir do modelo:
    ```bash
    cp .env.example .env
