@@ -181,7 +181,48 @@ def describe_table(table_name: str, schema: Optional[str] = None) -> List[Dict[s
             return _rows_to_dicts(cur, cur.fetchall())
 
 
+# Padrão para validar que a query começa com SELECT ou WITH
 _SAFE_SELECT_PATTERN = re.compile(r"^\s*(with|select)\b", re.IGNORECASE | re.DOTALL)
+
+# Palavras-chave perigosas que indicam operações de escrita/DDL
+_DANGEROUS_KEYWORDS = re.compile(
+    r"\b(insert|update|delete|drop|create|alter|truncate|exec|execute|grant|revoke|"
+    r"deny|backup|restore|shutdown|kill|reconfigure|dbcc|bulk|openrowset|opendatasource|"
+    r"xp_|sp_configure|sp_executesql)\b",
+    re.IGNORECASE
+)
+
+# Padrão para detectar múltiplos statements (ponto e vírgula seguido de comandos)
+_MULTI_STATEMENT_PATTERN = re.compile(r";\s*\w", re.IGNORECASE)
+
+
+def _validate_readonly_query(sql: str) -> None:
+    """Valida que a query é segura para execução read-only.
+    
+    Raises:
+        ValueError: Se a query contiver comandos perigosos ou padrões suspeitos.
+    """
+    if not sql or not sql.strip():
+        raise ValueError("A consulta SQL não pode estar vazia")
+    
+    # Verifica se começa com SELECT ou WITH
+    if not _SAFE_SELECT_PATTERN.search(sql):
+        raise ValueError("Apenas consultas de leitura são permitidas (deve iniciar com SELECT ou WITH)")
+    
+    # Bloqueia palavras-chave perigosas
+    dangerous_match = _DANGEROUS_KEYWORDS.search(sql)
+    if dangerous_match:
+        raise ValueError(
+            f"Comando não permitido detectado: '{dangerous_match.group()}'. "
+            "Apenas consultas SELECT/WITH são permitidas."
+        )
+    
+    # Bloqueia múltiplos statements (previne SQL injection com ;)
+    if _MULTI_STATEMENT_PATTERN.search(sql):
+        raise ValueError(
+            "Múltiplos statements não são permitidos. "
+            "Execute apenas uma consulta SELECT por vez."
+        )
 
 
 @app.tool()
@@ -190,18 +231,33 @@ def run_query(sql: str, max_rows: int = 1000) -> List[Dict[str, Any]]:
 
     - sql: consulta (deve iniciar com SELECT ou WITH)
     - max_rows: máximo de linhas a retornar (padrão: 1000)
+    
+    Segurança:
+    - Bloqueia comandos de escrita (INSERT, UPDATE, DELETE, etc.)
+    - Bloqueia comandos DDL (CREATE, DROP, ALTER, etc.)
+    - Bloqueia múltiplos statements (proteção contra SQL injection)
+    - Executa em transação com ROLLBACK automático (nada é persistido)
     """
-    if not sql or not _SAFE_SELECT_PATTERN.search(sql):
-        raise ValueError("Apenas consultas de leitura são permitidas (SELECT/WITH)")
+    # Validação de segurança
+    _validate_readonly_query(sql)
 
     if max_rows <= 0:
         max_rows = 1000
 
     with _open_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-            rows = cur.fetchmany(max_rows)
-            return _rows_to_dicts(cur, rows)
+        # Desabilita autocommit para controlar a transação manualmente
+        conn.autocommit = False
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchmany(max_rows)
+                result = _rows_to_dicts(cur, rows)
+        finally:
+            # SEMPRE faz rollback - mesmo para SELECT, garante que nada seja persistido
+            # caso algum comando malicioso passe pela validação
+            conn.rollback()
+        
+        return result
 
 
 if __name__ == "__main__":
