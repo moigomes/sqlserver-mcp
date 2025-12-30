@@ -13,6 +13,7 @@ Servidor MCP (Model Context Protocol) em Python para consultar Microsoft SQL Ser
   - [macOS](#macos)
   - [Linux (Ubuntu/Debian)](#linux-ubuntudebian)
   - [Windows](#windows)
+  - [Docker](#-docker)
 - [Configuração](#-configuração)
 - [Execução](#-execução)
 - [Integração com Cursor](#-integração-com-cursor)
@@ -136,6 +137,44 @@ Servidor MCP (Model Context Protocol) em Python para consultar Microsoft SQL Ser
    # Configure as variáveis de ambiente
    copy .env.example .env
    notepad .env
+   ```
+
+---
+
+### 🐳 Docker
+
+A forma mais fácil de rodar o servidor sem instalar dependências localmente.
+
+1. **Build da imagem**:
+   ```bash
+   docker build -t sqlserver-mcp .
+   ```
+
+2. **Crie o arquivo `.env`** com suas credenciais:
+   ```bash
+   cp .env.example .env
+   # Edite o .env com suas configurações
+   ```
+
+3. **Execute o container**:
+   ```bash
+   # Modo interativo (para testes)
+   docker run -it --env-file .env sqlserver-mcp
+   
+   # Ou com docker-compose
+   docker-compose up -d
+   ```
+
+4. **Comandos úteis**:
+   ```bash
+   # Ver logs
+   docker-compose logs -f
+   
+   # Parar
+   docker-compose down
+   
+   # Rebuild após alterações
+   docker-compose up -d --build
    ```
 
 ---

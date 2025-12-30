@@ -1,0 +1,52 @@
+# =============================================================================
+# Docker Compose para Servidor MCP SQL Server
+# =============================================================================
+# Uso:
+#   docker-compose up -d        # Iniciar
+#   docker-compose logs -f      # Ver logs
+#   docker-compose down         # Parar
+# =============================================================================
+
+version: '3.8'
+
+services:
+  sqlserver-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sqlserver-mcp
+    restart: unless-stopped
+    
+    # Variáveis de ambiente (pode usar .env ou definir aqui)
+    env_file:
+      - .env
+    
+    # Variáveis adicionais (sobrescrevem o .env se necessário)
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SQLSERVER_LOG_LEVEL=${SQLSERVER_LOG_LEVEL:-INFO}
+      - SQLSERVER_POOL_SIZE=${SQLSERVER_POOL_SIZE:-5}
+      - SQLSERVER_POOL_IDLE_TIME=${SQLSERVER_POOL_IDLE_TIME:-300}
+    
+    # Modo interativo para MCP via stdio
+    stdin_open: true
+    tty: true
+    
+    # Limites de recursos (opcional)
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+    
+    # Rede (opcional - útil se precisar conectar a outros containers)
+    networks:
+      - mcp-network
+
+networks:
+  mcp-network:
+    driver: bridge
+
