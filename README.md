@@ -2,6 +2,8 @@
 
 **Desenvolvido em Python por Moises Gomes**
 
+> 🌐 **Site oficial**: [moigomes.github.io/sqlserver-mcp-site](https://moigomes.github.io/sqlserver-mcp-site/)
+
 Servidor MCP (Model Context Protocol) em Python para consultar Microsoft SQL Server via `pyodbc`, expondo ferramentas para exploração de banco de dados, execução de consultas seguras e análise de estrutura.
 
 ---
